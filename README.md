@@ -233,16 +233,6 @@ On order creation/status change:
 
 Important: chat history in session is stored in JSON-safe format only.
 
----
-
-## Validation Checklist
-
-Run before merging:
-
-```bash
-python3 manage.py check
-python3 manage.py test
-```
 
 Manual smoke checks:
 
@@ -279,10 +269,4 @@ Manual smoke checks:
 
 ---
 
-## Additional Docs
 
-- Optional deeper write-up (includes production-oriented notes): [PRODUCTION_GUIDE.md](./PRODUCTION_GUIDE.md)
-- If you want to quickly understand what the project does and how it works end-to-end, start with:
-  - `PRODUCTION_GUIDE.md` -> "What we are building"
-  - `PRODUCTION_GUIDE.md` -> "How the system works end-to-end"
-  - `PRODUCTION_GUIDE.md` -> "Ownership and Change Map"
