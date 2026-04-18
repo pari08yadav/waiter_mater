@@ -1,119 +1,140 @@
 import os
 import json
 import google.generativeai as genai
-from agent.tools import get_all_orders, get_full_menu, get_order_status, update_order_status
-from agent.prompts import SYSTEM_PROMPT, STAFF_PROMPT
+from agent.tools import get_all_orders, get_order_status, place_order, smart_search_menu, update_order_status
+from agent.prompts import CUSTOMER_PROMPT, STAFF_PROMPT
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 
-def chat(user_message, session_uid, restaurant_id=None, session=None):
+def _normalize_session_history(raw_history):
+    """Return a Gemini-compatible history list from session-safe JSON data."""
+    if not isinstance(raw_history, list):
+        return []
+    normalized = []
+    for entry in raw_history:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        parts = entry.get("parts")
+        if not role or not isinstance(parts, list):
+            continue
+        safe_parts = []
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                safe_parts.append({"text": part["text"]})
+        if safe_parts:
+            normalized.append({"role": role, "parts": safe_parts})
+    return normalized
+
+
+def _serialize_history_for_session(history):
+    """Convert Gemini history objects to JSON-safe plain dicts."""
+    serializable = []
+    for content in history or []:
+        role = getattr(content, "role", None)
+        parts = getattr(content, "parts", None) or []
+        safe_parts = []
+        for part in parts:
+            text = getattr(part, "text", None)
+            if isinstance(text, str) and text:
+                safe_parts.append({"text": text})
+        if role and safe_parts:
+            serializable.append({"role": role, "parts": safe_parts})
+    return serializable
+
+
+
+
+import os
+import json
+import google.generativeai as genai
+# Ensure these are correctly exported from your tools.py
+from agent.tools import (
+    get_all_orders, 
+    get_order_status, 
+    place_order, 
+    smart_search_menu, 
+    update_order_status
+)
+from agent.prompts import CUSTOMER_PROMPT, STAFF_PROMPT
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+def customer_chat(user_message, session_uid, restaurant_id=None, table_uid=None, session=None):
+    # 1. Fetch history from Django session (defaults to empty list)
+    # We store history in the session so the AI remembers the conversation
+    history = []
+    if session is not None:
+        history = _normalize_session_history(session.get("chat_history", []))
+
+    customer_tools = [place_order]
+
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=CUSTOMER_PROMPT,
+        tools=customer_tools,
     )
 
-    history = session.get("chat_history", []) if session else []
+    # 2. Start chat with actual history
+    convo = model.start_chat(history=history, enable_automatic_function_calling=False)
 
-    convo = model.start_chat(history=history)
+    # 3. Context gathering (Menu & Orders)
+    relevant_items = smart_search_menu(query=user_message, restaurant_id=restaurant_id)
+    menu_context = json.dumps(relevant_items, indent=2)
 
-    if not history:
-        menu = get_full_menu(restaurant_id=restaurant_id)
-        menu_json = json.dumps(menu, indent=2)
-        first_message = f"Here is the complete restaurant menu:\n{menu_json}\n\nCustomer question: {user_message}"
-        response = convo.send_message(first_message)
-    else:
-        order_context = ""
-        if any(word in user_message.lower() for word in ["order", "status", "placed", "my order"]):
-            orders = get_order_status(session_uid)
-            if orders:
-                order_context = f"\n\nCustomer's current orders:\n{json.dumps(orders, indent=2)}"
-        response = convo.send_message(user_message + order_context)
+    order_context = ""
+    if any(word in user_message.lower() for word in ["order", "status", "placed", "my order"]):
+        orders = get_order_status(session_uid)
+        if orders:
+            order_context = f"\n\nCustomer's current orders:\n{json.dumps(orders, indent=2)}"
 
+    # 4. Construct the prompt
+    message = (
+        f"[SYSTEM CONTEXT: session_uid='{session_uid}', table_uid='{table_uid}']\n"
+        f"Available Menu Items:\n{menu_context}\n\n"
+        f"User Message: {user_message}{order_context}"
+    )
+
+    convo.send_message(message)
+
+    # 5. Agentic Loop
+    while True:
+        response = convo.last
+        candidate = response.candidates[0].content.parts[0]
+
+        if hasattr(candidate, 'function_call') and candidate.function_call.name:
+            fn_name = candidate.function_call.name
+            fn_args = dict(candidate.function_call.args)
+
+            if fn_name == "place_order":
+                fn_args['session_uid'] = session_uid
+                fn_args['table_uid'] = table_uid
+                result = place_order(**fn_args)
+
+            convo.send_message(
+                genai.protos.Content(
+                    parts=[genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=fn_name,
+                            response={"result": result},
+                        )
+                    )]
+                )
+            )
+        else:
+            break
+
+    # 6. CRITICAL: Save updated history back to session
     if session is not None:
-        updated_history = []
-        for msg in convo.history:
-            updated_history.append({
-                "role": msg.role,
-                "parts": [p.text for p in msg.parts],
-            })
-        session["chat_history"] = updated_history
+        session["chat_history"] = _serialize_history_for_session(convo.history)
 
-    return response.text
-
-
-
-# def staff_chat(user_message, restaurant_id, session=None):
-#     model = genai.GenerativeModel(
-#         model_name="gemini-2.5-flash",
-#         system_instruction="""You are a smart restaurant staff assistant.
-#                 You have access to all current orders for the restaurant.
-#                 You can help staff with:
-#                 - Summarizing pending, accepted, making or completed orders
-#                 - Finding specific orders by table number or status
-#                 - Updating order status when staff asks to accept, reject, or complete an order
-#                 - Answering any question about current orders
-
-#                 When staff asks to update an order status, extract the order uid and new status from their message and call update_order_status.
-#                 Always be concise and professional.""",
-#             )
-
-#     history = session.get("staff_chat_history", []) if session else []
-#     convo = model.start_chat(history=history)
-
-#     if not history:
-#         orders = get_all_orders(restaurant_id=restaurant_id)
-#         import json
-#         orders_json = json.dumps(orders, indent=2)
-#         first_message = f"Here are all current orders for the restaurant:\n{orders_json}\n\nStaff question: {user_message}"
-#         response = convo.send_message(first_message)
-#     else:
-#         # refresh orders on every follow up — orders change frequently
-#         orders = get_all_orders(restaurant_id=restaurant_id)
-#         orders_json = json.dumps(orders, indent=2)
-#         message_with_context = f"Latest orders:\n{orders_json}\n\nStaff question: {user_message}"
-#         response = convo.send_message(message_with_context)
-
-#     if session is not None:
-#         updated_history = []
-#         for msg in convo.history:
-#             updated_history.append({
-#                 "role": msg.role,
-#                 "parts": [p.text for p in msg.parts],
-#             })
-#         session["staff_chat_history"] = updated_history
-
-#     return response.text
+    return candidate.text
 
 
 
 def staff_chat(user_message, restaurant_id, session=None):
-    
-    staff_tools = [
-        {
-            "function_declarations": [
-                {
-                    "name": "update_order_status",
-                    "description": "Update the status of an order. Use this when staff asks to accept, reject, start making or complete an order.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "order_uid": {
-                                "type": "string",
-                                "description": "The UID of the order to update"
-                            },
-                            "status": {
-                                "type": "string",
-                                "enum": ["PENDING", "ACCEPTED", "REJECTED", "MAKING", "COMPLETED", "CANCELLED"],
-                                "description": "The new status to set"
-                            }
-                        },
-                        "required": ["order_uid", "status"]
-                    }
-                }
-            ]
-        }
-    ]
+    # Staff uses manual calling to handle status updates
+    staff_tools = [update_order_status]
 
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
@@ -121,24 +142,16 @@ def staff_chat(user_message, restaurant_id, session=None):
         tools=staff_tools,
     )
 
-    history = session.get("staff_chat_history", []) if session else []
-    convo = model.start_chat(
-        history=history,
-        enable_automatic_function_calling=False
-    )
+    convo = model.start_chat(history=[], enable_automatic_function_calling=False)
 
-    # always send fresh orders with every message
+    # Provide fresh orders context
     orders = get_all_orders(restaurant_id=restaurant_id)
     orders_json = json.dumps(orders, indent=2)
 
-    if not history:
-        message = f"Here are all current orders:\n{orders_json}\n\nStaff question: {user_message}"
-    else:
-        message = f"Latest orders:\n{orders_json}\n\nStaff question: {user_message}"
-
+    message = f"Current Restaurant Orders:\n{orders_json}\n\nStaff Message: {user_message}"
     convo.send_message(message)
 
-    # agentic loop
+    # Agentic Loop for Staff
     while True:
         response = convo.last
         candidate = response.candidates[0].content.parts[0]
@@ -162,14 +175,5 @@ def staff_chat(user_message, restaurant_id, session=None):
             )
         else:
             break
-
-    if session is not None:
-        updated_history = []
-        for msg in convo.history:
-            updated_history.append({
-                "role": msg.role,
-                "parts": [p.text for p in msg.parts],
-            })
-        session["staff_chat_history"] = updated_history
 
     return candidate.text
